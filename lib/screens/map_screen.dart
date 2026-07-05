@@ -1,3 +1,7 @@
+// ignore_for_file: file_names
+
+import 'dart:collection';
+
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart'; // Used for Distance calculations
@@ -26,18 +30,26 @@ class _MapScreenState extends State<MapScreen> {
   bool _isMapReady = false; 
   bool _isStyleLoaded = false;
 
-  StreamSubscription<Position>? _positionStream;
+  final double maxSpeedKmh = 250.0; // 250 KM/H
 
+  StreamSubscription<Position>? _positionStream;
+  Position? _lastSpeedPosition;
+  final Queue<Position> _positionHistory = Queue<Position>(); // logging recent positions for potential future use
+
+  String _selectedfacing = 'back'; // Default facing direction for new cameras
   DateTime? _entryTime;
   LatLng? _entryCameraPoint;
   double _liveAverageSpeed = 0.0;
-  double _currentSpeedKmh = 0.0;
+  double _calculatedSpeedKmh = 0.0;
+  double trustedSpeedKmh = 0.0;
   double? _nearestCameraDistanceMeters;
-  Position? _lastSpeedPosition;
-  double _minPanelExtent = 0.12; 
-  double _maxPanelExtent = 0.50; 
+  final double _minPanelExtent = 0.12; 
+  final double _maxPanelExtent = 0.50; 
   double _currentPanelHeight = 0.0;
   static const double _cameraWarningRangeMeters = 200.0;
+  int rejectedSpeed = 0; // Counter for rejected speed calculations exceeding max threshold
+  int acceptedSpeed = 0; // Counter for accepted speed calculations within max threshold
+  double displaySpeed = 0; // Smoothed speed for display purposes
 
   // Form Field Controllers
   final TextEditingController _nameController = TextEditingController();
@@ -45,7 +57,7 @@ class _MapScreenState extends State<MapScreen> {
   final TextEditingController _speedController = TextEditingController(text: "100");
   final TextEditingController _latController = TextEditingController();
   final TextEditingController _lngController = TextEditingController();
-  String _selectedfacing = 'back';
+  // final String _selectedfacing = 'back';
   
   // Track loaded database cameras locally to match taps to data indices
   List<Map<String, dynamic>> _rawCameraData = [];
@@ -85,28 +97,76 @@ class _MapScreenState extends State<MapScreen> {
     return 0.0;
   }
 
-  double _calculateCurrentSpeedKmh(Position position) {
-    final gpsSpeedKmh = position.speed * 3.6;
-    if (gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0) {
-      return gpsSpeedKmh;
+  _isPositionTrusted(Position newPosition){
+    for (int i = 0; i < _positionHistory.length; i++) {
+      final Position oldPosition = _positionHistory.elementAt(i);
+      final double distance = Distance().as(
+        LengthUnit.Meter,
+        LatLng(oldPosition.latitude, oldPosition.longitude),
+        LatLng(newPosition.latitude, newPosition.longitude),
+      );
+      debugPrint("Distance from history point $i: ${distance.toStringAsFixed(2)} meters");
     }
+    return true;
+  }
+    
+
+  double _calculateCurrentSpeedKmh(Position position) {
+    _isPositionTrusted(position);
+    final gpsSpeedKmh = position.speed * 3.6;
 
     final previousPosition = _lastSpeedPosition;
-    if (previousPosition == null) return _currentSpeedKmh;
+    if (previousPosition == null) {
+      return gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0
+          ? gpsSpeedKmh
+          : _calculatedSpeedKmh;
+    }
 
-    final secondsPassed =
-        position.timestamp.difference(previousPosition.timestamp).inMilliseconds /
-            1000;
-    if (secondsPassed <= 0) return _currentSpeedKmh;
+    final secondsPassed = position.timestamp.difference(previousPosition.timestamp).inMilliseconds /1000;
 
+    if (secondsPassed <= 0) {
+      return gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0
+      ? gpsSpeedKmh
+      : _calculatedSpeedKmh;
+    }
+
+    debugPrint("Prev: ${previousPosition.latitude}, ${previousPosition.longitude}");
+    debugPrint("Curr: ${position.latitude}, ${position.longitude}");
     const Distance distanceCalculator = Distance();
+
     final distanceMeters = distanceCalculator.as(
       LengthUnit.Meter,
       LatLng(previousPosition.latitude, previousPosition.longitude),
       LatLng(position.latitude, position.longitude),
     );
 
-    return (distanceMeters / secondsPassed) * 3.6;
+    final calculatedSpeedKmh = (distanceMeters / secondsPassed) * 3.6;
+    if (calculatedSpeedKmh > maxSpeedKmh) {
+      rejectedSpeed++;
+      debugPrint(
+      "Calculated speed exceeds max threshold: ${calculatedSpeedKmh.toStringAsFixed(1)} KM/H");
+      return displaySpeed;
+    }
+
+    acceptedSpeed++;
+
+    double trustedSpeedKmh;
+
+    if (gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0 && gpsSpeedKmh <= maxSpeedKmh) {
+      trustedSpeedKmh = gpsSpeedKmh;
+    } else {
+      trustedSpeedKmh = calculatedSpeedKmh;
+    }
+    
+    debugPrint("GPS: ${gpsSpeedKmh.toStringAsFixed(1)} | Calculated: ${calculatedSpeedKmh.toStringAsFixed(1)}");
+      debugPrint(
+        "Acc: ${position.accuracy.toStringAsFixed(1)}m | "
+        "GPS: ${gpsSpeedKmh.toStringAsFixed(1)} | "
+        "Calc: ${calculatedSpeedKmh.toStringAsFixed(1)} "
+        "Time: ${secondsPassed.toStringAsFixed(2)}s | "
+        "Distance: ${distanceMeters.toStringAsFixed(1)}m",
+      );
+    return trustedSpeedKmh;
   }
 
   double? _calculateNearestCameraDistanceMeters(Position userPosition) {
@@ -158,7 +218,12 @@ class _MapScreenState extends State<MapScreen> {
       permission = await Geolocator.requestPermission();
     }
 
-    if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
+    //if (permission == LocationPermission.whileInUse) {
+      // The app has permission to access location only while in use. You can still track the user's location, but it may not work in the background or when the app is closed.
+      // later, you might want to inform the user that for full functionality, they should grant "Always" permission.
+    //}
+
+    if (permission == LocationPermission.always || permission == LocationPermission.whileInUse) {
       const LocationSettings locationSettings = LocationSettings(
         accuracy: LocationAccuracy.bestForNavigation,
         distanceFilter: 1, 
@@ -166,12 +231,20 @@ class _MapScreenState extends State<MapScreen> {
 
       _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings)
         .listen((Position position) {
+          if (_positionHistory.length >= 10) {
+            _positionHistory.removeFirst();
+            _positionHistory.add(position);
+          } else {
+            _positionHistory.add(position);
+          }
+        
+
         final nearestCameraDistance = _calculateNearestCameraDistanceMeters(position);
         
         if (mounted) {
           setState(() {
             _currentLocation = LatLng(position.latitude, position.longitude);
-            _currentSpeedKmh = _calculateCurrentSpeedKmh(position);
+            _calculatedSpeedKmh = _calculateCurrentSpeedKmh(position);
             _nearestCameraDistanceMeters = nearestCameraDistance;
             _lastSpeedPosition = position;
           });
@@ -244,6 +317,7 @@ class _MapScreenState extends State<MapScreen> {
             });
           }
           
+          // ignore: use_build_context_synchronously      
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text("Sector complete! Tracking stopped."), backgroundColor: Colors.green),
           );
@@ -297,9 +371,13 @@ class _MapScreenState extends State<MapScreen> {
         );
       }
     } catch (e) {
-      print('Error mapping GPU viewport landmarks: $e');
+      // ignore: use_build_context_synchronously
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error syncing cameras: $e')),
+      );
     }
   }
+
 
   // ignore: unused_element
   Future<void> _submitCameraData() async {
@@ -316,6 +394,7 @@ class _MapScreenState extends State<MapScreen> {
         facing: _selectedfacing,
       );
 
+      // ignore: use_build_context_synchronously
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Camera successfully registered!'), backgroundColor: Colors.green),
       );
@@ -326,7 +405,10 @@ class _MapScreenState extends State<MapScreen> {
       _lngController.clear();
       _syncCamerasToMap();
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      // ignore: use_build_context_synchronously
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
     } finally {
       if (mounted) {
         setState(() => _isLoading = false);
@@ -391,7 +473,7 @@ class _MapScreenState extends State<MapScreen> {
               top: 20,
               left: 20,
               child: Card(
-                color: _currentSpeedKmh > 100
+                color: _calculatedSpeedKmh > 100
                     ? Colors.red.withValues(alpha: 0.9)
                     : Colors.black.withValues(alpha: 0.8),
                 elevation: 6,
@@ -406,7 +488,7 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        "${_currentSpeedKmh.toStringAsFixed(0)} KM/H",
+                        "${displaySpeed.toStringAsFixed(0)} KM/H",
                         style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
                       ),
                     ],
@@ -522,13 +604,13 @@ class _MapScreenState extends State<MapScreen> {
                 builder: (BuildContext context, ScrollController scrollController) {
                   return Container(
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.85), 
+                      color: Colors.black, 
                       borderRadius: const BorderRadius.only(
                         topLeft: Radius.circular(30),
                         topRight: Radius.circular(30),
                       ),
                       boxShadow: [
-                        BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 10, offset: const Offset(0, -3))
+                        BoxShadow(color: Colors.black, blurRadius: 10, offset: const Offset(0, -3))
                       ],
                     ),
                     child: SingleChildScrollView(
@@ -550,7 +632,7 @@ class _MapScreenState extends State<MapScreen> {
                               height: 50,
                               width: double.infinity,
                               decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.1),
+                                color: Colors.white,
                                 borderRadius: BorderRadius.circular(15),
                               ),
                               child: const Center(
@@ -579,7 +661,10 @@ class _MapScreenState extends State<MapScreen> {
                   setState(() {
                     _isEditMode = !_isEditMode;
                   });
-                  print("Map editing mode toggled: $_isEditMode");
+                  // ignore: use_build_context_synchronously
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text("Map editing mode toggled: $_isEditMode")),
+                  );
                 },
                 child: Icon(_isEditMode ? Icons.close : Icons.edit_road_rounded), 
               ),
