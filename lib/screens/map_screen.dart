@@ -30,7 +30,7 @@ class _MapScreenState extends State<MapScreen> {
   bool _isMapReady = false; 
   bool _isStyleLoaded = false;
 
-  final double maxSpeedKmh = 250.0; // 250 KM/H
+  final double maxSpeedKmh = 300.0; // 300 KM/H
 
   StreamSubscription<Position>? _positionStream;
   Position? _lastSpeedPosition;
@@ -47,9 +47,7 @@ class _MapScreenState extends State<MapScreen> {
   final double _maxPanelExtent = 0.50; 
   double _currentPanelHeight = 0.0;
   static const double _cameraWarningRangeMeters = 200.0;
-  int rejectedSpeed = 0; // Counter for rejected speed calculations exceeding max threshold
-  int acceptedSpeed = 0; // Counter for accepted speed calculations within max threshold
-  double displaySpeed = 0; // Smoothed speed for display purposes
+
 
   // Form Field Controllers
   final TextEditingController _nameController = TextEditingController();
@@ -97,6 +95,7 @@ class _MapScreenState extends State<MapScreen> {
     return 0.0;
   }
 
+  // ignore: unused_element
   _isPositionTrusted(Position newPosition){
     for (int i = 0; i < _positionHistory.length; i++) {
       final Position oldPosition = _positionHistory.elementAt(i);
@@ -109,17 +108,46 @@ class _MapScreenState extends State<MapScreen> {
     }
     return true;
   }
+  
+    double _calculateDistance(Position previous, Position current) {
+      return const Distance().as(
+        LengthUnit.Meter,
+        LatLng(previous.latitude, previous.longitude),
+        LatLng(current.latitude, current.longitude),
+      );
+    }
+
+    double _calculateSpeed(double distanceMeters, double secondsPassed) {
+      return (distanceMeters / secondsPassed) * 3.6;
+    }
+
+  bool _isSpeedReadingValid (Position previous, Position current, double calculatedSpeedKmh) { 
+    final double distance = Distance().as( 
+      LengthUnit.Meter, LatLng(previous.latitude, previous.longitude), 
+      LatLng(current.latitude, current.longitude), 
+    ); 
+    if (current.accuracy > 10.0) return false;
     
+    if (current.timestamp.difference(previous.timestamp).inMilliseconds < 500) return false;
+    
+    if (calculatedSpeedKmh > maxSpeedKmh) return false;
+    
+    if (distance < 5.0) return false;
 
+    if (current.speed < 1.0) return false;
+    
+  return true; 
+  }
+      
   double _calculateCurrentSpeedKmh(Position position) {
-    _isPositionTrusted(position);
+    
     final gpsSpeedKmh = position.speed * 3.6;
-
     final previousPosition = _lastSpeedPosition;
+
     if (previousPosition == null) {
       return gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0
-          ? gpsSpeedKmh
-          : _calculatedSpeedKmh;
+      ? gpsSpeedKmh
+      : _calculatedSpeedKmh;
     }
 
     final secondsPassed = position.timestamp.difference(previousPosition.timestamp).inMilliseconds /1000;
@@ -130,45 +158,27 @@ class _MapScreenState extends State<MapScreen> {
       : _calculatedSpeedKmh;
     }
 
-    debugPrint("Prev: ${previousPosition.latitude}, ${previousPosition.longitude}");
-    debugPrint("Curr: ${position.latitude}, ${position.longitude}");
-    const Distance distanceCalculator = Distance();
-
-    final distanceMeters = distanceCalculator.as(
-      LengthUnit.Meter,
-      LatLng(previousPosition.latitude, previousPosition.longitude),
-      LatLng(position.latitude, position.longitude),
+    final distanceMeters = _calculateDistance(
+      previousPosition,
+      position,
     );
 
-    final calculatedSpeedKmh = (distanceMeters / secondsPassed) * 3.6;
-    if (calculatedSpeedKmh > maxSpeedKmh) {
-      rejectedSpeed++;
-      debugPrint(
-      "Calculated speed exceeds max threshold: ${calculatedSpeedKmh.toStringAsFixed(1)} KM/H");
-      return displaySpeed;
-    }
-
-    acceptedSpeed++;
+    final calculatedSpeedKmh = _calculateSpeed(
+      distanceMeters, 
+      secondsPassed
+    );
 
     double trustedSpeedKmh;
 
-    if (gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0 && gpsSpeedKmh <= maxSpeedKmh) {
-      trustedSpeedKmh = gpsSpeedKmh;
+    if (!_isSpeedReadingValid(previousPosition, position, calculatedSpeedKmh)) {
+      trustedSpeedKmh = _calculatedSpeedKmh;
     } else {
-      trustedSpeedKmh = calculatedSpeedKmh;
+      trustedSpeedKmh = gpsSpeedKmh;
     }
     
-    debugPrint("GPS: ${gpsSpeedKmh.toStringAsFixed(1)} | Calculated: ${calculatedSpeedKmh.toStringAsFixed(1)}");
-      debugPrint(
-        "Acc: ${position.accuracy.toStringAsFixed(1)}m | "
-        "GPS: ${gpsSpeedKmh.toStringAsFixed(1)} | "
-        "Calc: ${calculatedSpeedKmh.toStringAsFixed(1)} "
-        "Time: ${secondsPassed.toStringAsFixed(2)}s | "
-        "Distance: ${distanceMeters.toStringAsFixed(1)}m",
-      );
     return trustedSpeedKmh;
   }
-
+  
   double? _calculateNearestCameraDistanceMeters(Position userPosition) {
     if (_rawCameraData.isEmpty) return null;
 
@@ -488,7 +498,7 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        "${displaySpeed.toStringAsFixed(0)} KM/H",
+                        "${_calculatedSpeedKmh.toStringAsFixed(0)} KM/H",
                         style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
                       ),
                     ],
