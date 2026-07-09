@@ -9,6 +9,10 @@ import 'package:speed_camera_app_2/Services/Supabase_service.dart';
 import 'package:speed_camera_app_2/Config/map_style.dart'; // Your TomTom Style String
 import 'dart:async';
 import 'package:maplibre_gl/maplibre_gl.dart' as mgl; // Native GPU Engine
+import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/services.dart';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -27,23 +31,40 @@ class _MapScreenState extends State<MapScreen> {
   bool _isEditMode = false;
   bool _isTrackingAverageSpeed = false;
   bool _isCameraLocked = false; 
+  final bool _isWarningEnabled = true;
   bool _isMapReady = false; 
   bool _isStyleLoaded = false;
+  
 
   final double maxSpeedKmh = 300.0; // 300 KM/H
 
   StreamSubscription<Position>? _positionStream;
   Position? _lastSpeedPosition;
-  final Queue<Position> _positionHistory = Queue<Position>(); // logging recent positions for potential future use
+  final Queue<Position> _positionHistory = Queue<Position>(); 
 
   String _selectedfacing = 'back'; // Default facing direction for new cameras
   DateTime? _entryTime;
   LatLng? _entryCameraPoint;
+  // ignore: unused_field
   double _liveAverageSpeed = 0.0;
   double _calculatedSpeedKmh = 0.0;
   double trustedSpeedKmh = 0.0;
   double? _nearestCameraDistanceMeters;
-  final double _minPanelExtent = 0.12; 
+  double? _displayedCameraDistanceMeters;
+  double? _previousNearestCameraDistanceMeters;
+  double? _closestDistanceToCurrentCameraMeters;
+  bool _hasPassedNearestCamera = false;
+
+  DateTime? _displayedDistanceReachedZeroAt;
+  Timer? _distancePredictionTimer;
+  DateTime? _lastDistanceGpsUpdateTime;
+  double? _lastRealCameraDistanceMeters;
+
+  final AudioPlayer _beepPlayer = AudioPlayer();
+  Timer? _beepTimer;
+  bool _isBeepingActive = false;
+
+  final double _minPanelExtent = 0.12;      
   final double _maxPanelExtent = 0.50; 
   double _currentPanelHeight = 0.0;
   static const double _cameraWarningRangeMeters = 200.0;
@@ -178,6 +199,47 @@ class _MapScreenState extends State<MapScreen> {
     
     return trustedSpeedKmh;
   }
+
+  double _calculateAverageRecentSpeedKmh() {
+  if (_positionHistory.length < 2) return _calculatedSpeedKmh;
+
+  final positions = _positionHistory.toList();
+  final int startIndex = positions.length > 10 ? positions.length - 10 : 0;
+
+  double totalSpeed = 0.0;
+  int validReadings = 0;
+
+  for (int i = startIndex + 1; i < positions.length; i++) {
+    final previous = positions[i - 1];
+    final current = positions[i];
+
+    final secondsPassed =
+        current.timestamp.difference(previous.timestamp).inMilliseconds / 1000;
+
+    if (secondsPassed <= 0) continue;
+
+    const Distance distanceCalculator = Distance();
+
+    final distanceMeters = distanceCalculator.as(
+      LengthUnit.Meter,
+      LatLng(previous.latitude, previous.longitude),
+      LatLng(current.latitude, current.longitude),
+    );
+
+    final speedKmh = (distanceMeters / secondsPassed) * 3.6;
+
+    if (speedKmh.isFinite && speedKmh >= 0 && speedKmh <= 180) {
+      totalSpeed += speedKmh;
+      validReadings++;
+    }
+  }
+
+  if (validReadings == 0) return _calculatedSpeedKmh;
+
+  return totalSpeed / validReadings;
+}
+
+  Map<String, dynamic>? _activeCamera;
   
   double? _calculateNearestCameraDistanceMeters(Position userPosition) {
     if (_rawCameraData.isEmpty) return null;
@@ -185,6 +247,7 @@ class _MapScreenState extends State<MapScreen> {
     const Distance distanceCalculator = Distance();
     final userLatLng = LatLng(userPosition.latitude, userPosition.longitude);
     double? nearestDistance;
+    Map<String, dynamic>? nearestCamera;
 
     for (final camera in _rawCameraData) {
       final cameraPoint = LatLng(
@@ -199,27 +262,219 @@ class _MapScreenState extends State<MapScreen> {
 
       if (nearestDistance == null || distanceToCamera < nearestDistance) {
         nearestDistance = distanceToCamera;
+        nearestCamera = camera;
       }
     }
-
+    _activeCamera = nearestCamera;
     return nearestDistance;
+  }
+
+  Color _warningBackgroundColor() {
+    if (_activeCamera == null) {
+      return Colors.black;
+    }
+
+    final double limit =
+        (_activeCamera!['speed_limit'] as num).toDouble();
+
+    final double distance =
+        _nearestCameraDistanceMeters ?? _cameraWarningRangeMeters;
+
+    final double opacity =
+        (1 - (distance / _cameraWarningRangeMeters))
+            .clamp(0.15, 1.0);
+
+    // Under the speed limit
+    if (_calculatedSpeedKmh <= limit) {
+      return Colors.white.withValues(alpha: opacity);
+    }
+
+    // Slightly over
+    if (_calculatedSpeedKmh <= limit + 15) {
+      return Colors.orange.withValues(alpha: opacity);
+    }
+
+    // Well over
+    return Colors.red.withValues(alpha: opacity);
+  }
+
+  Color _warningTextColor() {
+    if (_activeCamera == null) return Colors.white;
+
+    final double limit =
+        (_activeCamera!['speed_limit'] as num).toDouble();
+
+    return _calculatedSpeedKmh <= limit
+        ? Colors.black
+        : Colors.white;
+  }
+
+  bool _shouldShowCameraWarning() {
+    return !_hasPassedNearestCamera &&
+        _displayedCameraDistanceMeters != null &&
+        _displayedCameraDistanceMeters! > 0 &&
+        _displayedCameraDistanceMeters! <= _cameraWarningRangeMeters;
   }
 
   @override
   void initState() {
     super.initState();
     _startLiveTracking();
+    _startDistancePredictionTimer();
   }
 
   @override
   void dispose() {
     _positionStream?.cancel(); 
+    _distancePredictionTimer?.cancel();
+    _beepTimer?.cancel();
+    _beepPlayer.dispose();
+
     _nameController.dispose();
     _streetController.dispose();
     _speedController.dispose();
     _latController.dispose();
     _lngController.dispose();
+    
+    
     super.dispose();
+  }
+
+  Future<void> _playWarningBeep() async {
+    const int sampleRate = 44100;
+    const double frequency = 880.0;
+    const double durationSeconds = 0.15;
+    const int amplitude = 16000;
+
+    final int sampleCount = (sampleRate * durationSeconds).round();
+    final BytesBuilder bytes = BytesBuilder();
+
+    void writeString(String value) {
+      bytes.add(value.codeUnits);
+    }
+
+    void writeInt16(int value) {
+      bytes.add([
+        value & 0xff,
+        (value >> 8) & 0xff,
+      ]);
+    }
+
+    void writeInt32(int value) {
+      bytes.add([
+        value & 0xff,
+        (value >> 8) & 0xff,
+        (value >> 16) & 0xff,
+        (value >> 24) & 0xff,
+      ]);
+    }
+
+    final int dataSize = sampleCount * 2;
+
+    writeString('RIFF');
+    writeInt32(36 + dataSize);
+    writeString('WAVE');
+
+    writeString('fmt ');
+    writeInt32(16);
+    writeInt16(1);
+    writeInt16(1);
+    writeInt32(sampleRate);
+    writeInt32(sampleRate * 2);
+    writeInt16(2);
+    writeInt16(16);
+
+    writeString('data');
+    writeInt32(dataSize);
+
+    for (int i = 0; i < sampleCount; i++) {
+      final double t = i / sampleRate;
+      final int sample =
+          (math.sin(2 * math.pi * frequency * t) * amplitude).round();
+      writeInt16(sample);
+    }
+
+    await _beepPlayer.stop();
+    await _beepPlayer.play(BytesSource(bytes.toBytes()));
+  }
+
+  void _updateWarningBeep() {
+    print("BEEP CHECK: shouldBeep = ${_shouldShowCameraWarning()}, distance = $_displayedCameraDistanceMeters");
+    final bool shouldBeep = _shouldShowCameraWarning();
+
+    if (!shouldBeep) {
+      _beepTimer?.cancel();
+      _beepTimer = null;
+      _isBeepingActive = false;
+      return;
+    }
+
+    if (_isBeepingActive) return;
+
+    _isBeepingActive = true;
+
+    _beepTimer = Timer.periodic(const Duration(milliseconds: 1200), (timer) {
+      if (!_shouldShowCameraWarning()) {
+        timer.cancel();
+        _beepTimer = null;
+        _isBeepingActive = false;
+        return;
+      }
+
+      _playWarningBeep();
+    });
+  }
+
+  void _startDistancePredictionTimer() {
+    _distancePredictionTimer ??=
+    Timer.periodic(const Duration(milliseconds: 2000), (timer) {
+      if (!mounted) return;
+
+      if (_lastRealCameraDistanceMeters == null ||
+        _lastDistanceGpsUpdateTime == null ||
+        _hasPassedNearestCamera ||
+        _lastRealCameraDistanceMeters! > _cameraWarningRangeMeters) {
+        setState(() {
+          _displayedCameraDistanceMeters = null;
+        });
+        return;
+      }
+
+      final double averageSpeedKmh = _calculateAverageRecentSpeedKmh();
+
+      final double speedMetersPerSecond =
+          (averageSpeedKmh / 3.6).clamp(0.0, 60.0);
+
+      final double secondsSinceGpsUpdate =
+          DateTime.now()
+                  .difference(_lastDistanceGpsUpdateTime!)
+                  .inMilliseconds /
+              1000;
+
+      final double predictedDistance =
+          _lastRealCameraDistanceMeters! -
+              (speedMetersPerSecond * secondsSinceGpsUpdate);
+
+      setState(() {
+        _displayedCameraDistanceMeters =
+            predictedDistance.clamp(0.0, _cameraWarningRangeMeters);
+
+        if (_displayedCameraDistanceMeters == 0.0) {
+          _displayedDistanceReachedZeroAt ??= DateTime.now();
+
+          final bool stayedAtZeroFor3Seconds =
+              DateTime.now().difference(_displayedDistanceReachedZeroAt!).inSeconds >= 3;
+
+          if (stayedAtZeroFor3Seconds) {
+            _hasPassedNearestCamera = true;
+            _nearestCameraDistanceMeters = null;
+            _displayedCameraDistanceMeters = null;
+          }
+        } else {
+          _displayedDistanceReachedZeroAt = null;
+        }
+      });
+    });
   }
 
   void _startLiveTracking() async {
@@ -234,9 +489,14 @@ class _MapScreenState extends State<MapScreen> {
     //}
 
     if (permission == LocationPermission.always || permission == LocationPermission.whileInUse) {
-      const LocationSettings locationSettings = LocationSettings(
+      final LocationSettings locationSettings = AndroidSettings(
         accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 1, 
+        distanceFilter: 0,
+        foregroundNotificationConfig: ForegroundNotificationConfig(
+          notificationTitle: 'Speed camera warning active',
+          notificationText: 'Tracking your location for camera alerts',
+          enableWakeLock: true,
+        ),
       );
 
       _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings)
@@ -247,17 +507,48 @@ class _MapScreenState extends State<MapScreen> {
           } else {
             _positionHistory.add(position);
           }
-        
 
         final nearestCameraDistance = _calculateNearestCameraDistanceMeters(position);
+        if (nearestCameraDistance != null) {
+          if (_closestDistanceToCurrentCameraMeters == null ||
+              nearestCameraDistance < _closestDistanceToCurrentCameraMeters!) {
+            _closestDistanceToCurrentCameraMeters = nearestCameraDistance;
+          }
+        }
+        final bool passedCamera =
+          _previousNearestCameraDistanceMeters != null &&
+          nearestCameraDistance != null &&
+          _closestDistanceToCurrentCameraMeters != null &&
+          _closestDistanceToCurrentCameraMeters! <= 60.0 &&
+          nearestCameraDistance > _previousNearestCameraDistanceMeters! + 8.0;
         
         if (mounted) {
           setState(() {
             _currentLocation = LatLng(position.latitude, position.longitude);
             _calculatedSpeedKmh = _calculateCurrentSpeedKmh(position);
-            _nearestCameraDistanceMeters = nearestCameraDistance;
+            if (passedCamera) {
+              _hasPassedNearestCamera = true;
+            }
+            if (nearestCameraDistance == null ||
+              nearestCameraDistance > _cameraWarningRangeMeters + 100) {
+              _hasPassedNearestCamera = false;
+              _closestDistanceToCurrentCameraMeters = null;
+              _displayedDistanceReachedZeroAt = null;
+            }
+            if (_hasPassedNearestCamera) {
+              _nearestCameraDistanceMeters = null;
+              _displayedCameraDistanceMeters = null;
+              _lastRealCameraDistanceMeters = null;
+            } else {
+              _nearestCameraDistanceMeters = nearestCameraDistance;
+              _displayedCameraDistanceMeters = nearestCameraDistance;
+              _lastRealCameraDistanceMeters = nearestCameraDistance;
+              _lastDistanceGpsUpdateTime = DateTime.now();
+            }
+            _previousNearestCameraDistanceMeters = nearestCameraDistance;
             _lastSpeedPosition = position;
           });
+          _updateWarningBeep();
         }
 
         // Native GPU camera updates do not block the UI thread loop
@@ -413,7 +704,9 @@ class _MapScreenState extends State<MapScreen> {
       _streetController.clear();
       _latController.clear();
       _lngController.clear();
+      _speedController.clear();
       _syncCamerasToMap();
+      _isEditMode = false;
     } catch (e) {
       // ignore: use_build_context_synchronously
       ScaffoldMessenger.of(context).showSnackBar(
@@ -426,12 +719,138 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  Future<void> _showAddCameraSheet() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            top: 20,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  "Add Speed Camera",
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+
+                const SizedBox(height: 20),
+
+                TextField(
+                  controller: _nameController,
+                  decoration: const InputDecoration(
+                    labelText: "Camera Name",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+
+                const SizedBox(height: 15),
+
+                TextField(
+                  controller: _streetController,
+                  decoration: const InputDecoration(
+                    labelText: "Street Name",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+
+                const SizedBox(height: 15),
+
+                TextField(
+                  controller: _speedController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: "Speed Limit",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+
+                const SizedBox(height: 15),
+
+                DropdownButtonFormField<String>(
+                  value: _selectedfacing,
+                  decoration: const InputDecoration(
+                    labelText: "Camera Facing",
+                    border: OutlineInputBorder(),
+                  ),
+                  items: const [
+                    DropdownMenuItem(
+                      value: "front",
+                      child: Text("Front"),
+                    ),
+                    DropdownMenuItem(
+                      value: "back",
+                      child: Text("Back"),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    setState(() {
+                      _selectedfacing = value!;
+                    });
+                  },
+                ),
+
+                const SizedBox(height: 15),
+
+                TextField(
+                  controller: _latController,
+                  readOnly: true,
+                  decoration: const InputDecoration(
+                    labelText: "Latitude",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+
+                const SizedBox(height: 15),
+
+                TextField(
+                  controller: _lngController,
+                  readOnly: true,
+                  decoration: const InputDecoration(
+                    labelText: "Longitude",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+
+                const SizedBox(height: 25),
+
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      await _submitCameraData();
+
+                      if (context.mounted) {
+                        Navigator.pop(context);
+                      }
+                    },
+                    child: const Text("Save Camera"),
+                  ),
+                ),
+
+                const SizedBox(height: 15),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: _currentLocation == null
       ? const Center(child: CircularProgressIndicator())
-      : Stack( 
+      : Stack(
           children: [
             // HIGH PERFORMANCE NATIVE GPU VIEWPORT
             mgl.MapLibreMap(
@@ -474,9 +893,11 @@ class _MapScreenState extends State<MapScreen> {
                       _latController.text = latLng.latitude.toString();
                       _lngController.text = latLng.longitude.toString();
                     });
+
+                    _showAddCameraSheet();
                   }
                 }
-              },
+              }
             ),               
 
             Positioned(
@@ -512,51 +933,124 @@ class _MapScreenState extends State<MapScreen> {
               left: 20,
               right: 20,
               child: IgnorePointer(
-                ignoring: _nearestCameraDistanceMeters == null ||
-                    _nearestCameraDistanceMeters! > _cameraWarningRangeMeters,
+                ignoring: !_isWarningEnabled ||
+                _nearestCameraDistanceMeters == null ||
+                !_shouldShowCameraWarning(),
                 child: AnimatedOpacity(
                   duration: const Duration(milliseconds: 250),
                   curve: Curves.easeOutCubic,
-                  opacity: (_nearestCameraDistanceMeters != null &&
-                          _nearestCameraDistanceMeters! <= _cameraWarningRangeMeters)
-                      ? 1.0
-                      : 0.0,
+                  opacity: _shouldShowCameraWarning() ? 1.0 : 0.0,
                   child: AnimatedSlide(
                     duration: const Duration(milliseconds: 250),
                     curve: Curves.easeOutCubic,
-                    offset: (_nearestCameraDistanceMeters != null &&
-                            _nearestCameraDistanceMeters! <= _cameraWarningRangeMeters)
-                        ? Offset.zero
-                        : const Offset(0, -0.12),
+                    offset: _shouldShowCameraWarning()
+                      ? Offset.zero
+                      : const Offset(0, -0.12),
                     child: Card(
-                      color: Color.lerp(
-                        Colors.black.withValues(alpha: 0.82),
-                        Colors.red.withValues(alpha: 0.94),
-                        _nearestCameraDistanceMeters == null
-                            ? 0.0
-                            : (1 -
-                                    (_nearestCameraDistanceMeters! /
-                                        _cameraWarningRangeMeters))
-                                .clamp(0.0, 1.0),
-                      ),
+                      color: _warningBackgroundColor(),
                       elevation: 6,
                       child: Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 14.0),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
+                        child: Stack(
                           children: [
-                            const Text(
-                              "CAMERA AHEAD",
-                              style: TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold),
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8, right: 80),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(Icons.camera_alt, color: _warningTextColor(), size: 18),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        "SPEED CAMERA",
+                                        style: TextStyle(
+                                          color: _warningTextColor().withValues(alpha: 0.75),
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.bold,
+                                          letterSpacing: 1,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 14),
+                                  Text(
+                                    "${(_displayedCameraDistanceMeters ?? 0).toStringAsFixed(0)} meters away",
+                                    style: TextStyle(
+                                      color: _warningTextColor(),
+                                      fontSize: 54,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  LinearProgressIndicator(
+                                    value: _displayedCameraDistanceMeters == null
+                                      ? 0
+                                      : (1 - (_displayedCameraDistanceMeters! / _cameraWarningRangeMeters))
+                                          .clamp(0.0, 1.0),
+                                    minHeight: 6,
+                                    borderRadius: BorderRadius.circular(10),
+                                    backgroundColor: Colors.white24,
+                                    valueColor: AlwaysStoppedAnimation<Color>(_warningTextColor()),
+                                  ),
+                                  const SizedBox(height: 16),
+                                  const SizedBox(height: 72),
+                                  Text(
+                                    _activeCamera?['street_name'] ?? "",
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: _warningTextColor().withValues(alpha: 0.75),
+                                      fontSize: 15,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Text(
+                                    _calculatedSpeedKmh >
+                                            ((_activeCamera?['speed_limit'] ?? 999) as num).toDouble()
+                                        ? "⚠ SLOW DOWN"
+                                        : "✓ Speed OK",
+                                    style: TextStyle(
+                                      color: _warningTextColor(),
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              "${(_nearestCameraDistanceMeters ?? 0).toStringAsFixed((_nearestCameraDistanceMeters ?? 0) >= 10 ? 0 : 1)} M",
-                              style: const TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.bold),
-                            ),
-                            const Text(
-                              "Slow down smoothly",
-                              style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+
+                            Positioned(
+                              top: 0,
+                              right: 0,
+                              child: Container(
+                                width: 72,
+                                height: 72,
+                                decoration: const BoxDecoration(
+                                  color: Colors.red,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Center(
+                                  child: Container(
+                                    width: 56,
+                                    height: 56,
+                                    decoration: const BoxDecoration(
+                                      color: Colors.white,
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: Center(
+                                      child: Text(
+                                        "${_activeCamera?['speed_limit'] ?? '--'}",
+                                        style: const TextStyle(
+                                          color: Colors.black,
+                                          fontSize: 22,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ],
                         ),
@@ -567,96 +1061,66 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
 
-            if (_isTrackingAverageSpeed)
-              Positioned(
-                top: 245,
-                left: 20,
-                right: 20,
-                child: Card(
-                  color: _liveAverageSpeed > 100 ? Colors.red.withValues(alpha: 0.9) : Colors.black.withValues(alpha: 0.8),
-                  elevation: 6,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      children: [
-                        const Text(
-                          "LIVE ZONE AVERAGE SPEED",
-                          style: TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 5),
-                        Text(
-                          "${_liveAverageSpeed.toStringAsFixed(0)} KM/H",
-                          style: const TextStyle(color: Colors.white, fontSize: 42, fontWeight: FontWeight.bold),
-                        ),
-                        Text(
-                          _liveAverageSpeed > 100 ? "⚠️ TOO FAST! SLOW DOWN!" : "✅ SAFE SPEED",
-                          style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-
-            NotificationListener<DraggableScrollableNotification>(
-              onNotification: (notification) {
-                if (mounted) {
-                  setState(() {
-                    _currentPanelHeight = notification.extent * MediaQuery.of(context).size.height;
-                  });
-                }
-                return true;
-              },
-              child: DraggableScrollableSheet(
-                initialChildSize: _minPanelExtent,
-                minChildSize: _minPanelExtent,
-                maxChildSize: _maxPanelExtent,
-                builder: (BuildContext context, ScrollController scrollController) {
-                  return Container(
-                    decoration: BoxDecoration(
-                      color: Colors.black, 
-                      borderRadius: const BorderRadius.only(
-                        topLeft: Radius.circular(30),
-                        topRight: Radius.circular(30),
-                      ),
-                      boxShadow: [
-                        BoxShadow(color: Colors.black, blurRadius: 10, offset: const Offset(0, -3))
-                      ],
-                    ),
-                    child: SingleChildScrollView(
-                      controller: scrollController, 
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
-                        child: Column(
-                          children: [
-                            Container(
-                              width: 50,
-                              height: 5,
-                              decoration: BoxDecoration(
-                                color: Colors.white24,
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                            ),
-                            const SizedBox(height: 20),
-                            Container(
-                              height: 50,
-                              width: double.infinity,
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(15),
-                              ),
-                              child: const Center(
-                                child: Text("Search Bar coming here...", style: TextStyle(color: Colors.white30)),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
+              NotificationListener<DraggableScrollableNotification>(
+                onNotification: (notification) {
+                  if (mounted) {
+                    setState(() {
+                      _currentPanelHeight = notification.extent * MediaQuery.of(context).size.height;
+                    });
+                  }
+                  return true;
                 },
+                child: DraggableScrollableSheet(
+                  initialChildSize: _minPanelExtent,
+                  minChildSize: _minPanelExtent,
+                  maxChildSize: _maxPanelExtent,
+                  builder: (BuildContext context, ScrollController scrollController) {
+                    return Container(
+                      decoration: BoxDecoration(
+                        color: Colors.black, 
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(30),
+                          topRight: Radius.circular(30),
+                        ),
+                        boxShadow: [
+                          BoxShadow(color: Colors.black, blurRadius: 10, offset: const Offset(0, -3))
+                        ],
+                      ),
+                      child: SingleChildScrollView(
+                        controller: scrollController, 
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
+                          child: Column(
+                            children: [
+                              Container(
+                                width: 50,
+                                height: 5,
+                                decoration: BoxDecoration(
+                                  color: Colors.white24,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                              ),
+                              const SizedBox(height: 20),
+                              Container(
+                                height: 50,
+                                width: double.infinity,
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(15),
+                                ),
+                                child: const Center(
+                                  child: Text("Search Bar coming here...", style: TextStyle(color: Colors.white30)),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ),
-            ),
+            
 
             Positioned(
               bottom: _currentPanelHeight > 0 
@@ -669,16 +1133,18 @@ class _MapScreenState extends State<MapScreen> {
                 foregroundColor: Colors.black,
                 onPressed: () {
                   setState(() {
-                    _isEditMode = !_isEditMode;
+                    _isEditMode = true;
                   });
-                  // ignore: use_build_context_synchronously
                   ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text("Map editing mode toggled: $_isEditMode")),
+                    SnackBar(
+                      content: const Text("Map editing mode enabled. Tap on the map to select a location."),
+                    ),
                   );
                 },
                 child: Icon(_isEditMode ? Icons.close : Icons.edit_road_rounded), 
               ),
             ),
+          
 
             if (_isLoading)
               Positioned.fill(
@@ -689,6 +1155,7 @@ class _MapScreenState extends State<MapScreen> {
                   ),
                 ),
               ),
+      
             Positioned(
               bottom: _currentPanelHeight > 0 
               ? _currentPanelHeight + 85 
