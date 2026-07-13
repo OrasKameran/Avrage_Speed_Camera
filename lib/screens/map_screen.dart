@@ -10,9 +10,11 @@ import 'package:speed_camera_app_2/Config/map_style.dart'; // Your TomTom Style 
 import 'dart:async';
 import 'package:maplibre_gl/maplibre_gl.dart' as mgl; // Native GPU Engine
 import 'package:audioplayers/audioplayers.dart';
-import 'package:flutter/services.dart';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -23,6 +25,7 @@ class MapScreen extends StatefulWidget {
 
 class _MapScreenState extends State<MapScreen> {
   final SupabaseService _dbService = SupabaseService(); 
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   
   LatLng? _currentLocation;
   mgl.MapLibreMapController? _mapController;
@@ -34,6 +37,7 @@ class _MapScreenState extends State<MapScreen> {
   final bool _isWarningEnabled = true;
   bool _isMapReady = false; 
   bool _isStyleLoaded = false;
+  bool _autoStartProtectionEnabled = false;
   
 
   final double maxSpeedKmh = 300.0; // 300 KM/H
@@ -90,6 +94,57 @@ class _MapScreenState extends State<MapScreen> {
     if (value is int) return value;
     if (value is num) return value.round();
     return int.parse(value.toString());
+  }
+
+  double _angleDifference(double angle1, double angle2) {
+    final double difference = (angle1 - angle2).abs() % 360;
+    return difference > 180 ? 360 - difference : difference;
+  }
+
+  bool _isCameraInFrontOfDriver(Position userPosition, LatLng cameraPoint) {
+  final double heading = userPosition.heading;
+
+  if (!heading.isFinite || heading < 0) {
+    return true;
+  }
+
+  const Distance distanceCalculator = Distance();
+
+  final double bearingToCamera = distanceCalculator.bearing(
+    LatLng(userPosition.latitude, userPosition.longitude),
+    cameraPoint,
+  );
+
+  final double difference = _angleDifference(heading, bearingToCamera);
+
+  return difference <= 70.0;
+}
+
+  bool _isCameraFacingDriver(Position userPosition, LatLng cameraPoint, String facing) {
+    final double heading = userPosition.heading;
+
+    if (!heading.isFinite || heading < 0) {
+      return true;
+    }
+
+    const Distance distanceCalculator = Distance();
+
+    final double bearingToCamera = distanceCalculator.bearing(
+      LatLng(userPosition.latitude, userPosition.longitude),
+      cameraPoint,
+    );
+
+    final double difference = _angleDifference(heading, bearingToCamera);
+
+    if (facing == 'front') {
+      return difference <= 70.0;
+    }
+
+    if (facing == 'back') {
+      return difference <= 70.0;
+    }
+
+    return true;
   }
 
   double _calculateLiveSpeedKmh({
@@ -254,6 +309,17 @@ class _MapScreenState extends State<MapScreen> {
         _readDouble(camera['latitude']),
         _readDouble(camera['longitude']),
       );
+
+      final String facing = camera['facing']?.toString() ?? 'back';
+
+      // if (!_isCameraInFrontOfDriver(userPosition, cameraPoint)) {
+      //   continue;
+      // }
+
+      // if (!_isCameraFacingDriver(userPosition, cameraPoint, facing)) {
+      //   continue;
+      // }
+
       final distanceToCamera = distanceCalculator.as(
         LengthUnit.Meter,
         userLatLng,
@@ -318,10 +384,12 @@ class _MapScreenState extends State<MapScreen> {
 
   @override
   void initState() {
-    super.initState();
-    _startLiveTracking();
-    _startDistancePredictionTimer();
-  }
+  super.initState();
+  _loadAutoStartPreference();
+  _startLiveTracking();
+  _startDistancePredictionTimer();
+  
+}
 
   @override
   void dispose() {
@@ -338,6 +406,69 @@ class _MapScreenState extends State<MapScreen> {
     
     
     super.dispose();
+  }
+
+  Future<void> _loadAutoStartPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final enabled =
+        prefs.getBool(
+          'auto_start_protection_enabled',
+        ) ??
+        false;
+
+    final service = FlutterBackgroundService();
+    final running = await service.isRunning();
+
+    if (!mounted) return;
+
+    setState(() {
+      _autoStartProtectionEnabled =
+          enabled && running;
+    });
+  }
+
+
+  Future<void> _toggleProtection() async {
+    final service = FlutterBackgroundService();
+    final prefs = await SharedPreferences.getInstance();
+
+    if (_autoStartProtectionEnabled) {
+      service.invoke('stopService');
+
+      await prefs.setBool(
+        'auto_start_protection_enabled',
+        false,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _autoStartProtectionEnabled = false;
+      });
+    } else {
+      final alreadyRunning = await service.isRunning();
+
+      final started = alreadyRunning
+          ? true
+          : await service.startService();
+
+      if (!started) {
+        debugPrint('Failed to start protection service');
+        return;
+      }
+
+      await prefs.setBool(
+        'auto_start_protection_enabled',
+        true,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _autoStartProtectionEnabled = true;
+      });
+    }
   }
 
   Future<void> _playWarningBeep() async {
@@ -848,15 +979,45 @@ class _MapScreenState extends State<MapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: _currentLocation == null
-      ? const Center(child: CircularProgressIndicator())
-      : Stack(
+      key: _scaffoldKey,
+      drawer: Drawer(
+        child: SafeArea(
+          child: Column(
+            children: [
+              const ListTile(
+                title: Text(
+                  "Speed Camera App",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: Text("Settings and protection"),
+              ),
+              const Divider(),
+              SwitchListTile(
+                title: const Text('Background protection'),
+                subtitle: Text(
+                  _autoStartProtectionEnabled
+                      ? 'Protection is running'
+                      : 'Protection is stopped',
+                ),
+                value: _autoStartProtectionEnabled,
+                onChanged: (_) {
+                  _toggleProtection();
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+      body: Stack(
           children: [
             // HIGH PERFORMANCE NATIVE GPU VIEWPORT
             mgl.MapLibreMap(
               styleString: tomtomHybridStyle, // Consumes your split TomTom server JSON
               initialCameraPosition: mgl.CameraPosition(
-                target: mgl.LatLng(_currentLocation!.latitude, _currentLocation!.longitude),
+                target: mgl.LatLng(
+                    _currentLocation?.latitude ?? 36.1911,
+                    _currentLocation?.longitude ?? 44.0092,
+                  ),
                 zoom: 14.0,
               ),
               myLocationEnabled: true, // Native blue location dot tracked by operating system
@@ -898,11 +1059,25 @@ class _MapScreenState extends State<MapScreen> {
                   }
                 }
               }
-            ),               
+            ),       
 
             Positioned(
               top: 20,
               left: 20,
+              child: FloatingActionButton.small(
+                heroTag: "btn_menu",
+                backgroundColor: Colors.black.withValues(alpha: 0.8),
+                foregroundColor: Colors.white,
+                onPressed: () {
+                  _scaffoldKey.currentState?.openDrawer();
+                },
+                child: const Icon(Icons.menu),
+              ),
+            ),        
+
+            Positioned(
+              top: 20,
+              left: 75,
               child: Card(
                 color: _calculatedSpeedKmh > 100
                     ? Colors.red.withValues(alpha: 0.9)

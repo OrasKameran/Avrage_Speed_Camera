@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.speed_camera_app_2"
+    namespace = "com.oras.begharama"
     compileSdk = 36  // Hardcoded to 36 for MapLibre
     ndkVersion = "28.1.13356709" // Hardcoded to the exact NDK version it requested
 
@@ -23,7 +23,7 @@ android {
         val flutterVersionCode = project.findProperty("flutter.versionCode")?.toString()?.toIntOrNull() ?: 1
         val flutterVersionName = project.findProperty("flutter.versionName")?.toString() ?: "1.0"
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.speed_camera_app_2"
+        applicationId = "com.oras.begharama"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 23

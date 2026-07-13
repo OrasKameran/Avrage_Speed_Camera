@@ -41,6 +41,8 @@ dependencies:
   cupertino_icons: ^1.0.8
   supabase_flutter: ^2.15.0
   audioplayers: ^6.6.0
+  shared_preferences: ^2.5.3
+  flutter_background_service: ^5.1.0
 
 
 dev_dependencies:
