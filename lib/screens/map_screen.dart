@@ -23,13 +23,15 @@ class MapScreen extends StatefulWidget {
   State<MapScreen> createState() => _MapScreenState();
 }
 
-class _MapScreenState extends State<MapScreen> {
+class _MapScreenState extends State<MapScreen>
+    with WidgetsBindingObserver {
   final SupabaseService _dbService = SupabaseService(); 
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   
   LatLng? _currentLocation;
   mgl.MapLibreMapController? _mapController;
   
+  bool _appIsVisible = true;
   bool _isLoading = false;
   bool _isEditMode = false;
   bool _isTrackingAverageSpeed = false;
@@ -384,12 +386,43 @@ class _MapScreenState extends State<MapScreen> {
 
   @override
   void initState() {
-  super.initState();
-  _loadAutoStartPreference();
-  _startLiveTracking();
-  _startDistancePredictionTimer();
-  
-}
+    super.initState();
+
+    WidgetsBinding.instance.addObserver(this);
+
+    _loadAutoStartPreference();
+    _startDistancePredictionTimer();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appIsVisible = state == AppLifecycleState.resumed;
+
+    if (_autoStartProtectionEnabled) {
+      // Background service owns tracking.
+      _stopForegroundTracking();
+      return;
+    }
+
+    if (_appIsVisible) {
+      // App is open and protection toggle is OFF.
+      _startLiveTracking();
+    } else {
+      // No background protection requested, so save battery.
+      _stopForegroundTracking();
+    }
+  }
+
+  Future<void> _stopForegroundTracking() async {
+    await _positionStream?.cancel();
+    _positionStream = null;
+
+    _beepTimer?.cancel();
+    _beepTimer = null;
+
+    _isBeepingActive = false;
+    await _beepPlayer.stop();
+  }
 
   @override
   void dispose() {
@@ -609,6 +642,9 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _startLiveTracking() async {
+    if (_positionStream != null) return;
+    if (_autoStartProtectionEnabled) return;
+    if (!_appIsVisible) return;
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
