@@ -227,6 +227,32 @@ Future<void> protectionServiceEntryPoint(
     );
   }
 
+  bool backgroundProtectionEnabled = false;
+  // ignore: unused_local_variable
+  bool appVisible = true;
+
+  service.on('setBackgroundProtection').listen((event) {
+    backgroundProtectionEnabled =
+        event?['enabled'] == true;
+  });
+
+  service.on('appVisible').listen((event) {
+    appVisible = true;
+  });
+
+  service.on('appHidden').listen((event) async {
+    appVisible = false;
+
+    if (!backgroundProtectionEnabled) {
+      stopWarning();
+
+      await positionSubscription?.cancel();
+      await beepPlayer.dispose();
+
+      await service.stopSelf();
+    }
+  });
+
   service.on('stopService').listen((event) async {
     stopWarning();
 
@@ -238,6 +264,8 @@ Future<void> protectionServiceEntryPoint(
 
     await service.stopSelf();
   });
+
+  
 
   await loadCameras();
 

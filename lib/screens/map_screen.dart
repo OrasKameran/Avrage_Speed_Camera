@@ -1,17 +1,11 @@
 // ignore_for_file: file_names
-
-import 'dart:collection';
-
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart'; // Used for Distance calculations
 import 'package:speed_camera_app_2/Services/Supabase_service.dart'; 
 import 'package:speed_camera_app_2/Config/map_style.dart'; // Your TomTom Style String
 import 'dart:async';
 import 'package:maplibre_gl/maplibre_gl.dart' as mgl; // Native GPU Engine
 import 'package:audioplayers/audioplayers.dart';
-import 'dart:math' as math;
-import 'dart:typed_data';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 
@@ -34,7 +28,6 @@ class _MapScreenState extends State<MapScreen>
   bool _appIsVisible = true;
   bool _isLoading = false;
   bool _isEditMode = false;
-  bool _isTrackingAverageSpeed = false;
   bool _isCameraLocked = false; 
   final bool _isWarningEnabled = true;
   bool _isMapReady = false; 
@@ -44,36 +37,23 @@ class _MapScreenState extends State<MapScreen>
 
   final double maxSpeedKmh = 300.0; // 300 KM/H
 
-  StreamSubscription<Position>? _positionStream;
-  Position? _lastSpeedPosition;
-  final Queue<Position> _positionHistory = Queue<Position>(); 
+  StreamSubscription<Map<String, dynamic>?>?
+    _serviceUpdateSubscription;
 
   String _selectedfacing = 'back'; // Default facing direction for new cameras
-  DateTime? _entryTime;
-  LatLng? _entryCameraPoint;
-  // ignore: unused_field
-  double _liveAverageSpeed = 0.0;
   double _calculatedSpeedKmh = 0.0;
   double trustedSpeedKmh = 0.0;
   double? _nearestCameraDistanceMeters;
   double? _displayedCameraDistanceMeters;
-  double? _previousNearestCameraDistanceMeters;
-  double? _closestDistanceToCurrentCameraMeters;
   bool _hasPassedNearestCamera = false;
-
-  DateTime? _displayedDistanceReachedZeroAt;
-  Timer? _distancePredictionTimer;
-  DateTime? _lastDistanceGpsUpdateTime;
-  double? _lastRealCameraDistanceMeters;
 
   final AudioPlayer _beepPlayer = AudioPlayer();
   Timer? _beepTimer;
-  bool _isBeepingActive = false;
 
   final double _minPanelExtent = 0.12;      
   final double _maxPanelExtent = 0.50; 
   double _currentPanelHeight = 0.0;
-  static const double _cameraWarningRangeMeters = 200.0;
+  static const double _cameraWarningRangeMeters = 2000.0;
 
 
   // Form Field Controllers
@@ -98,244 +78,7 @@ class _MapScreenState extends State<MapScreen>
     return int.parse(value.toString());
   }
 
-  double _angleDifference(double angle1, double angle2) {
-    final double difference = (angle1 - angle2).abs() % 360;
-    return difference > 180 ? 360 - difference : difference;
-  }
-
-  bool _isCameraInFrontOfDriver(Position userPosition, LatLng cameraPoint) {
-  final double heading = userPosition.heading;
-
-  if (!heading.isFinite || heading < 0) {
-    return true;
-  }
-
-  const Distance distanceCalculator = Distance();
-
-  final double bearingToCamera = distanceCalculator.bearing(
-    LatLng(userPosition.latitude, userPosition.longitude),
-    cameraPoint,
-  );
-
-  final double difference = _angleDifference(heading, bearingToCamera);
-
-  return difference <= 70.0;
-}
-
-  bool _isCameraFacingDriver(Position userPosition, LatLng cameraPoint, String facing) {
-    final double heading = userPosition.heading;
-
-    if (!heading.isFinite || heading < 0) {
-      return true;
-    }
-
-    const Distance distanceCalculator = Distance();
-
-    final double bearingToCamera = distanceCalculator.bearing(
-      LatLng(userPosition.latitude, userPosition.longitude),
-      cameraPoint,
-    );
-
-    final double difference = _angleDifference(heading, bearingToCamera);
-
-    if (facing == 'front') {
-      return difference <= 70.0;
-    }
-
-    if (facing == 'back') {
-      return difference <= 70.0;
-    }
-
-    return true;
-  }
-
-  double _calculateLiveSpeedKmh({
-    required Position position,
-    required double distanceTraveledMeters,
-  }) {
-    final gpsSpeedKmh = position.speed * 3.6;
-    if (gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0) {
-      return gpsSpeedKmh;
-    }
-
-    final secondsPassed =
-        position.timestamp.difference(_entryTime!).inMilliseconds / 1000;
-    if (secondsPassed > 0) {
-      return (distanceTraveledMeters / secondsPassed) * 3.6;
-    }
-
-    final fallbackSecondsPassed =
-        DateTime.now().difference(_entryTime!).inMilliseconds / 1000;
-    if (fallbackSecondsPassed > 0) {
-      return (distanceTraveledMeters / fallbackSecondsPassed) * 3.6;
-    }
-
-    return 0.0;
-  }
-
-  // ignore: unused_element
-  _isPositionTrusted(Position newPosition){
-    for (int i = 0; i < _positionHistory.length; i++) {
-      final Position oldPosition = _positionHistory.elementAt(i);
-      final double distance = Distance().as(
-        LengthUnit.Meter,
-        LatLng(oldPosition.latitude, oldPosition.longitude),
-        LatLng(newPosition.latitude, newPosition.longitude),
-      );
-      debugPrint("Distance from history point $i: ${distance.toStringAsFixed(2)} meters");
-    }
-    return true;
-  }
-  
-    double _calculateDistance(Position previous, Position current) {
-      return const Distance().as(
-        LengthUnit.Meter,
-        LatLng(previous.latitude, previous.longitude),
-        LatLng(current.latitude, current.longitude),
-      );
-    }
-
-    double _calculateSpeed(double distanceMeters, double secondsPassed) {
-      return (distanceMeters / secondsPassed) * 3.6;
-    }
-
-  bool _isSpeedReadingValid (Position previous, Position current, double calculatedSpeedKmh) { 
-    final double distance = Distance().as( 
-      LengthUnit.Meter, LatLng(previous.latitude, previous.longitude), 
-      LatLng(current.latitude, current.longitude), 
-    ); 
-    if (current.accuracy > 10.0) return false;
-    
-    if (current.timestamp.difference(previous.timestamp).inMilliseconds < 500) return false;
-    
-    if (calculatedSpeedKmh > maxSpeedKmh) return false;
-    
-    if (distance < 5.0) return false;
-
-    if (current.speed < 1.0) return false;
-    
-  return true; 
-  }
-      
-  double _calculateCurrentSpeedKmh(Position position) {
-    
-    final gpsSpeedKmh = position.speed * 3.6;
-    final previousPosition = _lastSpeedPosition;
-
-    if (previousPosition == null) {
-      return gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0
-      ? gpsSpeedKmh
-      : _calculatedSpeedKmh;
-    }
-
-    final secondsPassed = position.timestamp.difference(previousPosition.timestamp).inMilliseconds /1000;
-
-    if (secondsPassed <= 0) {
-      return gpsSpeedKmh.isFinite && gpsSpeedKmh > 1.0
-      ? gpsSpeedKmh
-      : _calculatedSpeedKmh;
-    }
-
-    final distanceMeters = _calculateDistance(
-      previousPosition,
-      position,
-    );
-
-    final calculatedSpeedKmh = _calculateSpeed(
-      distanceMeters, 
-      secondsPassed
-    );
-
-    double trustedSpeedKmh;
-
-    if (!_isSpeedReadingValid(previousPosition, position, calculatedSpeedKmh)) {
-      trustedSpeedKmh = _calculatedSpeedKmh;
-    } else {
-      trustedSpeedKmh = gpsSpeedKmh;
-    }
-    
-    return trustedSpeedKmh;
-  }
-
-  double _calculateAverageRecentSpeedKmh() {
-  if (_positionHistory.length < 2) return _calculatedSpeedKmh;
-
-  final positions = _positionHistory.toList();
-  final int startIndex = positions.length > 10 ? positions.length - 10 : 0;
-
-  double totalSpeed = 0.0;
-  int validReadings = 0;
-
-  for (int i = startIndex + 1; i < positions.length; i++) {
-    final previous = positions[i - 1];
-    final current = positions[i];
-
-    final secondsPassed =
-        current.timestamp.difference(previous.timestamp).inMilliseconds / 1000;
-
-    if (secondsPassed <= 0) continue;
-
-    const Distance distanceCalculator = Distance();
-
-    final distanceMeters = distanceCalculator.as(
-      LengthUnit.Meter,
-      LatLng(previous.latitude, previous.longitude),
-      LatLng(current.latitude, current.longitude),
-    );
-
-    final speedKmh = (distanceMeters / secondsPassed) * 3.6;
-
-    if (speedKmh.isFinite && speedKmh >= 0 && speedKmh <= 180) {
-      totalSpeed += speedKmh;
-      validReadings++;
-    }
-  }
-
-  if (validReadings == 0) return _calculatedSpeedKmh;
-
-  return totalSpeed / validReadings;
-}
-
   Map<String, dynamic>? _activeCamera;
-  
-  double? _calculateNearestCameraDistanceMeters(Position userPosition) {
-    if (_rawCameraData.isEmpty) return null;
-
-    const Distance distanceCalculator = Distance();
-    final userLatLng = LatLng(userPosition.latitude, userPosition.longitude);
-    double? nearestDistance;
-    Map<String, dynamic>? nearestCamera;
-
-    for (final camera in _rawCameraData) {
-      final cameraPoint = LatLng(
-        _readDouble(camera['latitude']),
-        _readDouble(camera['longitude']),
-      );
-
-      final String facing = camera['facing']?.toString() ?? 'back';
-
-      // if (!_isCameraInFrontOfDriver(userPosition, cameraPoint)) {
-      //   continue;
-      // }
-
-      // if (!_isCameraFacingDriver(userPosition, cameraPoint, facing)) {
-      //   continue;
-      // }
-
-      final distanceToCamera = distanceCalculator.as(
-        LengthUnit.Meter,
-        userLatLng,
-        cameraPoint,
-      );
-
-      if (nearestDistance == null || distanceToCamera < nearestDistance) {
-        nearestDistance = distanceToCamera;
-        nearestCamera = camera;
-      }
-    }
-    _activeCamera = nearestCamera;
-    return nearestDistance;
-  }
 
   Color _warningBackgroundColor() {
     if (_activeCamera == null) {
@@ -390,44 +133,15 @@ class _MapScreenState extends State<MapScreen>
 
     WidgetsBinding.instance.addObserver(this);
 
+    _listenToProtectionService();
     _loadAutoStartPreference();
-    _startDistancePredictionTimer();
-  }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    _appIsVisible = state == AppLifecycleState.resumed;
-
-    if (_autoStartProtectionEnabled) {
-      // Background service owns tracking.
-      _stopForegroundTracking();
-      return;
-    }
-
-    if (_appIsVisible) {
-      // App is open and protection toggle is OFF.
-      _startLiveTracking();
-    } else {
-      // No background protection requested, so save battery.
-      _stopForegroundTracking();
-    }
-  }
-
-  Future<void> _stopForegroundTracking() async {
-    await _positionStream?.cancel();
-    _positionStream = null;
-
-    _beepTimer?.cancel();
-    _beepTimer = null;
-
-    _isBeepingActive = false;
-    await _beepPlayer.stop();
   }
 
   @override
   void dispose() {
-    _positionStream?.cancel(); 
-    _distancePredictionTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+
     _beepTimer?.cancel();
     _beepPlayer.dispose();
 
@@ -436,364 +150,158 @@ class _MapScreenState extends State<MapScreen>
     _speedController.dispose();
     _latController.dispose();
     _lngController.dispose();
-    
-    
+    _serviceUpdateSubscription?.cancel();
+
     super.dispose();
+  }
+
+  @override
+  Future<void> didChangeAppLifecycleState(
+    AppLifecycleState state,
+  ) async {
+    _appIsVisible = state == AppLifecycleState.resumed;
+
+    final service = FlutterBackgroundService();
+
+    if (_appIsVisible) {
+      bool running = await service.isRunning();
+
+      if (!running) {
+        running = await service.startService();
+      }
+
+      if (running) {
+        service.invoke('appVisible');
+
+        service.invoke(
+          'setBackgroundProtection',
+          {
+            'enabled': _autoStartProtectionEnabled,
+          },
+        );
+      }
+    } else {
+      service.invoke(
+        'appHidden',
+        {
+          'keepRunning':
+              _autoStartProtectionEnabled,
+        },
+      );
+    }
+  }
+
+  Future<void> _stopForegroundTracking() async {
+    _beepTimer?.cancel();
+    _beepTimer = null;
+
+    await _beepPlayer.stop();
   }
 
   Future<void> _loadAutoStartPreference() async {
     final prefs = await SharedPreferences.getInstance();
 
-    final enabled =
+    final savedEnabled =
         prefs.getBool(
           'auto_start_protection_enabled',
         ) ??
         false;
 
     final service = FlutterBackgroundService();
-    final running = await service.isRunning();
+    bool serviceRunning = await service.isRunning();
+
+    if (!serviceRunning) {
+      serviceRunning = await service.startService();
+    }
+
+    final protectionActive = savedEnabled;
+    
 
     if (!mounted) return;
 
     setState(() {
       _autoStartProtectionEnabled =
-          enabled && running;
+          protectionActive;
     });
-  }
 
+    await _stopForegroundTracking();
+  }
 
   Future<void> _toggleProtection() async {
     final service = FlutterBackgroundService();
     final prefs = await SharedPreferences.getInstance();
 
-    if (_autoStartProtectionEnabled) {
-      service.invoke('stopService');
+    final bool newValue = !_autoStartProtectionEnabled;
 
-      await prefs.setBool(
-        'auto_start_protection_enabled',
-        false,
-      );
+    await prefs.setBool(
+      'auto_start_protection_enabled',
+      newValue,
+    );
 
-      if (!mounted) return;
+    final bool serviceRunning = await service.isRunning();
 
-      setState(() {
-        _autoStartProtectionEnabled = false;
-      });
-    } else {
-      final alreadyRunning = await service.isRunning();
-
-      final started = alreadyRunning
-          ? true
-          : await service.startService();
+    if (!serviceRunning) {
+      final bool started = await service.startService();
 
       if (!started) {
         debugPrint('Failed to start protection service');
         return;
       }
-
-      await prefs.setBool(
-        'auto_start_protection_enabled',
-        true,
-      );
-
-      if (!mounted) return;
-
-      setState(() {
-        _autoStartProtectionEnabled = true;
-      });
-    }
-  }
-
-  Future<void> _playWarningBeep() async {
-    const int sampleRate = 44100;
-    const double frequency = 880.0;
-    const double durationSeconds = 0.15;
-    const int amplitude = 16000;
-
-    final int sampleCount = (sampleRate * durationSeconds).round();
-    final BytesBuilder bytes = BytesBuilder();
-
-    void writeString(String value) {
-      bytes.add(value.codeUnits);
     }
 
-    void writeInt16(int value) {
-      bytes.add([
-        value & 0xff,
-        (value >> 8) & 0xff,
-      ]);
-    }
+    service.invoke(
+      'setBackgroundProtection',
+      {
+        'enabled': newValue,
+      },
+    );
 
-    void writeInt32(int value) {
-      bytes.add([
-        value & 0xff,
-        (value >> 8) & 0xff,
-        (value >> 16) & 0xff,
-        (value >> 24) & 0xff,
-      ]);
-    }
+    if (!mounted) return;
 
-    final int dataSize = sampleCount * 2;
-
-    writeString('RIFF');
-    writeInt32(36 + dataSize);
-    writeString('WAVE');
-
-    writeString('fmt ');
-    writeInt32(16);
-    writeInt16(1);
-    writeInt16(1);
-    writeInt32(sampleRate);
-    writeInt32(sampleRate * 2);
-    writeInt16(2);
-    writeInt16(16);
-
-    writeString('data');
-    writeInt32(dataSize);
-
-    for (int i = 0; i < sampleCount; i++) {
-      final double t = i / sampleRate;
-      final int sample =
-          (math.sin(2 * math.pi * frequency * t) * amplitude).round();
-      writeInt16(sample);
-    }
-
-    await _beepPlayer.stop();
-    await _beepPlayer.play(BytesSource(bytes.toBytes()));
-  }
-
-  void _updateWarningBeep() {
-    print("BEEP CHECK: shouldBeep = ${_shouldShowCameraWarning()}, distance = $_displayedCameraDistanceMeters");
-    final bool shouldBeep = _shouldShowCameraWarning();
-
-    if (!shouldBeep) {
-      _beepTimer?.cancel();
-      _beepTimer = null;
-      _isBeepingActive = false;
-      return;
-    }
-
-    if (_isBeepingActive) return;
-
-    _isBeepingActive = true;
-
-    _beepTimer = Timer.periodic(const Duration(milliseconds: 1200), (timer) {
-      if (!_shouldShowCameraWarning()) {
-        timer.cancel();
-        _beepTimer = null;
-        _isBeepingActive = false;
-        return;
-      }
-
-      _playWarningBeep();
+    setState(() {
+      _autoStartProtectionEnabled = newValue;
     });
   }
+ 
+  void _listenToProtectionService() {
+    _serviceUpdateSubscription =
+        FlutterBackgroundService()
+            .on('protectionUpdate')
+            .listen((event) {
+      if (event == null || !mounted) return;
 
-  void _startDistancePredictionTimer() {
-    _distancePredictionTimer ??=
-    Timer.periodic(const Duration(milliseconds: 2000), (timer) {
-      if (!mounted) return;
+      final distanceValue = event['cameraDistance'];
 
-      if (_lastRealCameraDistanceMeters == null ||
-        _lastDistanceGpsUpdateTime == null ||
-        _hasPassedNearestCamera ||
-        _lastRealCameraDistanceMeters! > _cameraWarningRangeMeters) {
-        setState(() {
-          _displayedCameraDistanceMeters = null;
-        });
-        return;
-      }
-
-      final double averageSpeedKmh = _calculateAverageRecentSpeedKmh();
-
-      final double speedMetersPerSecond =
-          (averageSpeedKmh / 3.6).clamp(0.0, 60.0);
-
-      final double secondsSinceGpsUpdate =
-          DateTime.now()
-                  .difference(_lastDistanceGpsUpdateTime!)
-                  .inMilliseconds /
-              1000;
-
-      final double predictedDistance =
-          _lastRealCameraDistanceMeters! -
-              (speedMetersPerSecond * secondsSinceGpsUpdate);
+      final double? distance =
+          distanceValue is num &&
+                  distanceValue.isFinite
+              ? distanceValue.toDouble()
+              : null;
 
       setState(() {
-        _displayedCameraDistanceMeters =
-            predictedDistance.clamp(0.0, _cameraWarningRangeMeters);
+        _currentLocation = LatLng(
+          (event['latitude'] as num).toDouble(),
+          (event['longitude'] as num).toDouble(),
+        );
 
-        if (_displayedCameraDistanceMeters == 0.0) {
-          _displayedDistanceReachedZeroAt ??= DateTime.now();
+        _calculatedSpeedKmh =
+            (event['speedKmh'] as num).toDouble();
 
-          final bool stayedAtZeroFor3Seconds =
-              DateTime.now().difference(_displayedDistanceReachedZeroAt!).inSeconds >= 3;
+        _nearestCameraDistanceMeters = distance;
+        _displayedCameraDistanceMeters = distance;
 
-          if (stayedAtZeroFor3Seconds) {
-            _hasPassedNearestCamera = true;
-            _nearestCameraDistanceMeters = null;
-            _displayedCameraDistanceMeters = null;
-          }
-        } else {
-          _displayedDistanceReachedZeroAt = null;
-        }
+        _activeCamera = {
+          'name': event['cameraName'],
+          'speed_limit': event['speedLimit'],
+          'street_name': event['streetName'] ?? '',
+        };
+
+        _hasPassedNearestCamera = false;
       });
     });
   }
 
-  void _startLiveTracking() async {
-    if (_positionStream != null) return;
-    if (_autoStartProtectionEnabled) return;
-    if (!_appIsVisible) return;
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
 
-    //if (permission == LocationPermission.whileInUse) {
-      // The app has permission to access location only while in use. You can still track the user's location, but it may not work in the background or when the app is closed.
-      // later, you might want to inform the user that for full functionality, they should grant "Always" permission.
-    //}
-
-    if (permission == LocationPermission.always || permission == LocationPermission.whileInUse) {
-      final LocationSettings locationSettings = AndroidSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
-        foregroundNotificationConfig: ForegroundNotificationConfig(
-          notificationTitle: 'Speed camera warning active',
-          notificationText: 'Tracking your location for camera alerts',
-          enableWakeLock: true,
-        ),
-      );
-
-      _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings)
-        .listen((Position position) {
-          if (_positionHistory.length >= 10) {
-            _positionHistory.removeFirst();
-            _positionHistory.add(position);
-          } else {
-            _positionHistory.add(position);
-          }
-
-        final nearestCameraDistance = _calculateNearestCameraDistanceMeters(position);
-        if (nearestCameraDistance != null) {
-          if (_closestDistanceToCurrentCameraMeters == null ||
-              nearestCameraDistance < _closestDistanceToCurrentCameraMeters!) {
-            _closestDistanceToCurrentCameraMeters = nearestCameraDistance;
-          }
-        }
-        final bool passedCamera =
-          _previousNearestCameraDistanceMeters != null &&
-          nearestCameraDistance != null &&
-          _closestDistanceToCurrentCameraMeters != null &&
-          _closestDistanceToCurrentCameraMeters! <= 60.0 &&
-          nearestCameraDistance > _previousNearestCameraDistanceMeters! + 8.0;
-        
-        if (mounted) {
-          setState(() {
-            _currentLocation = LatLng(position.latitude, position.longitude);
-            _calculatedSpeedKmh = _calculateCurrentSpeedKmh(position);
-            if (passedCamera) {
-              _hasPassedNearestCamera = true;
-            }
-            if (nearestCameraDistance == null ||
-              nearestCameraDistance > _cameraWarningRangeMeters + 100) {
-              _hasPassedNearestCamera = false;
-              _closestDistanceToCurrentCameraMeters = null;
-              _displayedDistanceReachedZeroAt = null;
-            }
-            if (_hasPassedNearestCamera) {
-              _nearestCameraDistanceMeters = null;
-              _displayedCameraDistanceMeters = null;
-              _lastRealCameraDistanceMeters = null;
-            } else {
-              _nearestCameraDistanceMeters = nearestCameraDistance;
-              _displayedCameraDistanceMeters = nearestCameraDistance;
-              _lastRealCameraDistanceMeters = nearestCameraDistance;
-              _lastDistanceGpsUpdateTime = DateTime.now();
-            }
-            _previousNearestCameraDistanceMeters = nearestCameraDistance;
-            _lastSpeedPosition = position;
-          });
-          _updateWarningBeep();
-        }
-
-        // Native GPU camera updates do not block the UI thread loop
-        if (_isCameraLocked && _isMapReady && _mapController != null && _currentLocation != null) {
-          _mapController!.animateCamera(
-            mgl.CameraUpdate.newLatLng(
-              mgl.LatLng(_currentLocation!.latitude, _currentLocation!.longitude),
-            ),
-          );
-        }
-
-        _checkCameraGeofences(position);
-
-        if (_isTrackingAverageSpeed && _entryCameraPoint != null && _entryTime != null) {
-          const Distance distanceCalculator = Distance();
-            
-          double distanceTraveledMeters = distanceCalculator.as(
-            LengthUnit.Meter,
-            _entryCameraPoint!,
-            LatLng(position.latitude, position.longitude),
-          );
-
-          if (mounted) {
-            setState(() {
-              _liveAverageSpeed = _calculateLiveSpeedKmh(
-                position: position,
-                distanceTraveledMeters: distanceTraveledMeters,
-              );
-            });
-          }
-        }
-      });
-    }
-  }
-
-  void _checkCameraGeofences(Position userPosition) {
-    if (_rawCameraData.isEmpty) return;
-
-    const Distance distanceCalculator = Distance();
-    final LatLng userLatLng = LatLng(userPosition.latitude, userPosition.longitude);
-
-    for (var camera in _rawCameraData) {
-      final LatLng cameraPoint = LatLng(
-        _readDouble(camera['latitude']),
-        _readDouble(camera['longitude']),
-      );
-      double distanceToCamera = distanceCalculator.as(LengthUnit.Meter, userLatLng, cameraPoint);
-
-      if (distanceToCamera <= 25.0) {
-        if (!_isTrackingAverageSpeed) {
-          if (mounted) {
-            setState(() {
-              _isTrackingAverageSpeed = true;
-              _entryTime = userPosition.timestamp;
-              _entryCameraPoint = cameraPoint;
-              _liveAverageSpeed = 0.0; 
-            });
-          }
-          return;
-        } 
-        else if (_isTrackingAverageSpeed && cameraPoint != _entryCameraPoint) {
-          if (mounted) {
-            setState(() {
-              _isTrackingAverageSpeed = false;
-              _entryTime = null;
-              _entryCameraPoint = null;
-            });
-          }
-          
-          // ignore: use_build_context_synchronously      
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Sector complete! Tracking stopped."), backgroundColor: Colors.green),
-          );
-          break;
-        }
-      }
-    }
-  }
 
   Future<void> _syncCamerasToMap() async {
     if (_mapController == null || !_isStyleLoaded) return;
@@ -847,7 +355,7 @@ class _MapScreenState extends State<MapScreen>
   }
 
 
-  // ignore: unused_element
+
   Future<void> _submitCameraData() async {
     if (_latController.text.isEmpty || _lngController.text.isEmpty) return;
 
