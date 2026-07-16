@@ -53,6 +53,9 @@ Future<void> protectionServiceEntryPoint(
   StreamSubscription<Position>? positionSubscription;
   Timer? beepTimer;
 
+  Position? lastPosition;
+  double trustedSpeedKmh = 0.0;
+
   List<Map<String, dynamic>> cameras = [];
 
   bool warningActive = false;
@@ -91,6 +94,84 @@ Future<void> protectionServiceEntryPoint(
 
       print('BACKGROUND CAMERA LOAD ERROR: $error');
     }
+  }
+
+  double calculateTrustedSpeed(Position position) {
+    final double gpsSpeedKmh =
+        math.max(0.0, position.speed * 3.6);
+
+    final Position? previous = lastPosition;
+
+    if (previous == null) {
+      lastPosition = position;
+
+      if (gpsSpeedKmh.isFinite &&
+          position.accuracy <= 20.0) {
+        trustedSpeedKmh = gpsSpeedKmh;
+      }
+
+      return trustedSpeedKmh;
+    }
+
+    final double secondsPassed = position.timestamp
+            .difference(previous.timestamp)
+            .inMilliseconds /
+        1000.0;
+
+    if (secondsPassed <= 0) {
+      return trustedSpeedKmh;
+    }
+
+    const Distance distanceCalculator = Distance();
+
+    final double distanceMeters =
+        distanceCalculator.as(
+      LengthUnit.Meter,
+      LatLng(previous.latitude, previous.longitude),
+      LatLng(position.latitude, position.longitude),
+    );
+
+    final double calculatedSpeedKmh =
+        (distanceMeters / secondsPassed) * 3.6;
+
+    lastPosition = position;
+
+    final bool gpsSpeedValid =
+        gpsSpeedKmh.isFinite &&
+        gpsSpeedKmh <= 300.0;
+
+    final bool calculatedSpeedValid =
+        calculatedSpeedKmh.isFinite &&
+        calculatedSpeedKmh >= 0 &&
+        calculatedSpeedKmh <= 300.0;
+
+    if (!gpsSpeedValid) {
+      return trustedSpeedKmh;
+    }
+
+    if (position.accuracy > 30.0) {
+      return trustedSpeedKmh;
+    }
+
+    if (calculatedSpeedValid) {
+      final double difference =
+          (gpsSpeedKmh - calculatedSpeedKmh).abs();
+
+      final double comparisonSpeed =
+          math.max(gpsSpeedKmh, calculatedSpeedKmh);
+
+      final double differencePercentage =
+          comparisonSpeed > 0
+              ? difference / comparisonSpeed
+              : 0.0;
+
+      if (differencePercentage > 0.80) {
+        return trustedSpeedKmh;
+      }
+    }
+
+    trustedSpeedKmh = gpsSpeedKmh;
+    return trustedSpeedKmh;
   }
 
   double calculateNearestCameraDistance(
@@ -284,12 +365,13 @@ Future<void> protectionServiceEntryPoint(
           calculateNearestCameraDistance(position);
 
       final double speedKmh =
-          math.max(0, position.speed * 3.6);
+          calculateTrustedSpeed(position);
 
       final bool cameraIsNear =
           nearestDistance != null &&
           nearestDistance!.isFinite &&
           nearestDistance! <= _warningRangeMeters;
+          
 
       if (cameraIsNear) {
         startWarning();

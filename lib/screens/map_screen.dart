@@ -18,7 +18,7 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   final SupabaseService _dbService = SupabaseService(); 
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   
@@ -32,8 +32,7 @@ class _MapScreenState extends State<MapScreen>
   final bool _isWarningEnabled = true;
   bool _isMapReady = false; 
   bool _isStyleLoaded = false;
-  bool _autoStartProtectionEnabled = false;
-  
+  bool _autoStartProtectionEnabled = false;  
 
   final double maxSpeedKmh = 300.0; // 300 KM/H
 
@@ -49,11 +48,13 @@ class _MapScreenState extends State<MapScreen>
 
   final AudioPlayer _beepPlayer = AudioPlayer();
   Timer? _beepTimer;
-
+  Timer? _recenterDebounceTimer;
   final double _minPanelExtent = 0.12;      
   final double _maxPanelExtent = 0.50; 
   double _currentPanelHeight = 0.0;
-  static const double _cameraWarningRangeMeters = 2000.0;
+  static const double _cameraWarningRangeMeters = 200.0;
+  late final AnimationController _warningPulseController;
+  late final Animation<double> _warningPulse;
 
 
   // Form Field Controllers
@@ -127,6 +128,41 @@ class _MapScreenState extends State<MapScreen>
         _displayedCameraDistanceMeters! <= _cameraWarningRangeMeters;
   }
 
+  double? _currentSpeedLimit() {
+    final value = _activeCamera?['speed_limit'];
+
+    if (value is num) {
+      return value.toDouble();
+    }
+
+    return null;
+  }
+
+  double _speedingPercentage() {
+    final limit = _currentSpeedLimit();
+
+    if (limit == null || limit <= 0) {
+      return 0.0;
+    }
+
+    return ((_calculatedSpeedKmh - limit) / limit)
+        .clamp(0.0, double.infinity);
+  }
+
+  Color? _speedingWarningColor() {
+    final percentage = _speedingPercentage();
+
+    if (percentage <= 0) {
+      return null;
+    }
+
+    if (percentage <= 0.10) {
+      return Colors.orange;
+    }
+
+    return Colors.red;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -136,6 +172,17 @@ class _MapScreenState extends State<MapScreen>
     _listenToProtectionService();
     _loadAutoStartPreference();
 
+    _warningPulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+
+    _warningPulse = CurvedAnimation(
+      parent: _warningPulseController,
+      curve: Curves.easeInOut,
+    );
+
+    _warningPulseController.repeat(reverse: true);
   }
 
   @override
@@ -150,7 +197,10 @@ class _MapScreenState extends State<MapScreen>
     _speedController.dispose();
     _latController.dispose();
     _lngController.dispose();
+    _warningPulseController.dispose();
+
     _serviceUpdateSubscription?.cancel();
+    _recenterDebounceTimer?.cancel();
 
     super.dispose();
   }
@@ -301,18 +351,45 @@ class _MapScreenState extends State<MapScreen>
     });
   }
 
+  void _scheduleRecenterAfterPan() {
+    _recenterDebounceTimer?.cancel();
 
+    if (!_isCameraLocked) return;
+
+    _recenterDebounceTimer = Timer(
+      const Duration(seconds: 5),
+      () {
+        if (!_isCameraLocked ||
+            !_isMapReady ||
+            _mapController == null ||
+            _currentLocation == null) {
+          return;
+        }
+
+        _mapController!.animateCamera(
+          mgl.CameraUpdate.newLatLng(
+            mgl.LatLng(
+              _currentLocation!.latitude,
+              _currentLocation!.longitude,
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   Future<void> _syncCamerasToMap() async {
-    if (_mapController == null || !_isStyleLoaded) return;
+    final controller = _mapController;
+
+    if (controller == null || !_isStyleLoaded) return;
 
     try {
-      final data = await _dbService.fetchCameras(); 
-      _rawCameraData = List<Map<String, dynamic>>.from(data);
+      final data = await _dbService.fetchCameras();
+      _rawCameraData =
+          List<Map<String, dynamic>>.from(data);
 
-      // Clear previous symbols to avoid duplicates on data refreshes
-      await _mapController!.clearSymbols();
-      await _mapController!.clearCircles();
+      // await controller.clearSymbols();
+      // await controller.clearCircles();
 
       for (var camera in _rawCameraData) {
         final double lat = _readDouble(camera['latitude']);
@@ -320,7 +397,7 @@ class _MapScreenState extends State<MapScreen>
         final int speedLimit = _readInt(camera['speed_limit']);
         final mgl.LatLng cameraPoint = mgl.LatLng(lat, lng);
 
-        await _mapController!.addCircle(
+        await controller.addCircle(
           mgl.CircleOptions(
             geometry: cameraPoint,
             circleRadius: 7.0,
@@ -332,16 +409,14 @@ class _MapScreenState extends State<MapScreen>
           ),
         );
 
-        // Adds the location natively to the map's GPU canvas stream
-        await _mapController!.addSymbol(
+        await controller.addSymbol(
           mgl.SymbolOptions(
             geometry: cameraPoint,
-            iconSize: 1.5,
-            textField: "$speedLimit KM/H",
+            textField: '$speedLimit KM/H',
             textOffset: const Offset(0, 1.5),
             textSize: 11,
-            textColor: "#FF9800",
-            textHaloColor: "#000000",
+            textColor: '#FF9800',
+            textHaloColor: '#000000',
             textHaloWidth: 1.0,
           ),
         );
@@ -556,6 +631,7 @@ class _MapScreenState extends State<MapScreen>
           children: [
             // HIGH PERFORMANCE NATIVE GPU VIEWPORT
             mgl.MapLibreMap(
+              trackCameraPosition: true,
               styleString: tomtomHybridStyle, // Consumes your split TomTom server JSON
               initialCameraPosition: mgl.CameraPosition(
                 target: mgl.LatLng(
@@ -572,7 +648,7 @@ class _MapScreenState extends State<MapScreen>
                 _isMapReady = true;
                 
                 // Set up the tap listener for GPU items
-                _mapController!.onSymbolTapped.add((symbol) {
+                controller.onSymbolTapped.add((symbol) {
                   // Find the matching camera data dictionary matching this coordinate signature
                   final match = _rawCameraData.firstWhere(
                     (c) => (c['latitude'] - symbol.options.geometry!.latitude).abs() < 0.0001,
@@ -586,9 +662,24 @@ class _MapScreenState extends State<MapScreen>
                 });
               },
 
-              onStyleLoadedCallback: () {
+              onCameraMove: (cameraPosition) {
+                _recenterDebounceTimer?.cancel();
+              },
+
+              onCameraIdle: () {
+                _scheduleRecenterAfterPan();
+              },
+
+              onStyleLoadedCallback: () async {
                 _isStyleLoaded = true;
-                _syncCamerasToMap();
+
+                await Future<void>.delayed(
+                  const Duration(milliseconds: 500),
+                );
+
+                if (!mounted) return;
+
+                await _syncCamerasToMap();
               },
               
               onMapClick: (point, latLng) {
@@ -620,41 +711,135 @@ class _MapScreenState extends State<MapScreen>
             ),        
 
             Positioned(
-              top: 20,
-              left: 75,
-              child: Card(
-                color: _calculatedSpeedKmh > 100
-                    ? Colors.red.withValues(alpha: 0.9)
-                    : Colors.black.withValues(alpha: 0.8),
-                elevation: 6,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text(
-                        "LIVE SPEED",
-                        style: TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        "${_calculatedSpeedKmh.toStringAsFixed(0)} KM/H",
-                        style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
-                      ),
-                    ],
-                  ),
+              bottom: _currentPanelHeight > 0
+                  ? _currentPanelHeight + 20
+                  : (MediaQuery.of(context).size.height * _minPanelExtent) + 20,
+              left: 20,
+              child: TweenAnimationBuilder<double>(
+                tween: Tween<double>(
+                  begin: 0,
+                  end: _calculatedSpeedKmh,
                 ),
+                duration: const Duration(milliseconds: 350),
+                curve: Curves.easeOutCubic,
+                builder: (context, animatedSpeed, child) {
+                  final double? speedLimit =
+                      _activeCamera?['speed_limit'] is num
+                          ? (_activeCamera!['speed_limit'] as num).toDouble()
+                          : null;
+
+                  final bool isSpeeding =
+                      speedLimit != null && animatedSpeed > speedLimit;
+
+                  final bool isFarOver =
+                      speedLimit != null && animatedSpeed > speedLimit + 15;
+
+                  final Color speedBorderColor = isFarOver
+                      ? Colors.red
+                      : isSpeeding
+                          ? Colors.orange
+                          : Colors.black;
+
+                  return SizedBox(
+                    width: 125,
+                    height: 125,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Positioned(
+                          bottom: 0,
+                          left: 0,
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 300),
+                            curve: Curves.easeOutCubic,
+                            width: 105,
+                            height: 105,
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: speedBorderColor,
+                                width: 6,
+                              ),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Colors.black38,
+                                  blurRadius: 10,
+                                  offset: Offset(0, 4),
+                                ),
+                              ],
+                            ),
+                            child: Center(
+                              child: AnimatedDefaultTextStyle(
+                                duration: const Duration(milliseconds: 300),
+                                style: TextStyle(
+                                  color: isSpeeding
+                                      ? speedBorderColor
+                                      : Colors.black,
+                                  fontSize: 42,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                                child: Text(
+                                  animatedSpeed.toStringAsFixed(0),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+
+                        Positioned(
+                          top: 0,
+                          right: 0,
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 300),
+                            width: 58,
+                            height: 58,
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: speedLimit == null
+                                    ? Colors.grey
+                                    : Colors.red,
+                                width: 6,
+                              ),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Colors.black26,
+                                  blurRadius: 6,
+                                  offset: Offset(0, 3),
+                                ),
+                              ],
+                            ),
+                            child: Center(
+                              child: Text(
+                                speedLimit == null
+                                    ? '--'
+                                    : speedLimit.toStringAsFixed(0),
+                                style: TextStyle(
+                                  color: speedLimit == null
+                                      ? Colors.grey
+                                      : Colors.black,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
 
             Positioned(
-              top: 105,
+              top: 90,
               left: 20,
               right: 20,
               child: IgnorePointer(
-                ignoring: !_isWarningEnabled ||
-                _nearestCameraDistanceMeters == null ||
-                !_shouldShowCameraWarning(),
+                ignoring: !_isWarningEnabled || !_shouldShowCameraWarning(),
                 child: AnimatedOpacity(
                   duration: const Duration(milliseconds: 250),
                   curve: Curves.easeOutCubic,
@@ -663,112 +848,102 @@ class _MapScreenState extends State<MapScreen>
                     duration: const Duration(milliseconds: 250),
                     curve: Curves.easeOutCubic,
                     offset: _shouldShowCameraWarning()
-                      ? Offset.zero
-                      : const Offset(0, -0.12),
-                    child: Card(
-                      color: _warningBackgroundColor(),
-                      elevation: 6,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 14.0),
-                        child: Stack(
+                        ? Offset.zero
+                        : const Offset(0, -0.15),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeOutCubic,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 14,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _warningBackgroundColor(),
+                        borderRadius: BorderRadius.circular(22),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black38,
+                            blurRadius: 14,
+                            offset: Offset(0, 6),
+                          ),
+                        ],
+                      ),
+                      child: SizedBox(
+                        height: 115,
+                        child: Row(
                           children: [
-                            Padding(
-                              padding: const EdgeInsets.only(top: 8, right: 80),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      Icon(Icons.camera_alt, color: _warningTextColor(), size: 18),
-                                      const SizedBox(width: 8),
-                                      Text(
-                                        "SPEED CAMERA",
-                                        style: TextStyle(
-                                          color: _warningTextColor().withValues(alpha: 0.75),
-                                          fontSize: 14,
-                                          fontWeight: FontWeight.bold,
-                                          letterSpacing: 1,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 14),
-                                  Text(
-                                    "${(_displayedCameraDistanceMeters ?? 0).toStringAsFixed(0)} meters away",
-                                    style: TextStyle(
-                                      color: _warningTextColor(),
-                                      fontSize: 54,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 12),
-                                  LinearProgressIndicator(
-                                    value: _displayedCameraDistanceMeters == null
-                                      ? 0
-                                      : (1 - (_displayedCameraDistanceMeters! / _cameraWarningRangeMeters))
-                                          .clamp(0.0, 1.0),
-                                    minHeight: 6,
-                                    borderRadius: BorderRadius.circular(10),
-                                    backgroundColor: Colors.white24,
-                                    valueColor: AlwaysStoppedAnimation<Color>(_warningTextColor()),
-                                  ),
-                                  const SizedBox(height: 16),
-                                  const SizedBox(height: 72),
-                                  Text(
-                                    _activeCamera?['street_name'] ?? "",
-                                    textAlign: TextAlign.center,
-                                    style: TextStyle(
-                                      color: _warningTextColor().withValues(alpha: 0.75),
-                                      fontSize: 15,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 12),
-                                  Text(
-                                    _calculatedSpeedKmh >
-                                            ((_activeCamera?['speed_limit'] ?? 999) as num).toDouble()
-                                        ? "⚠ SLOW DOWN"
-                                        : "✓ Speed OK",
-                                    style: TextStyle(
-                                      color: _warningTextColor(),
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ],
+                            Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                color: _warningTextColor().withValues(alpha: 0.14),
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                Icons.speed_rounded,
+                                color: _warningTextColor(),
+                                size: 38,
                               ),
                             ),
 
-                            Positioned(
-                              top: 0,
-                              right: 0,
-                              child: Container(
-                                width: 72,
-                                height: 72,
-                                decoration: const BoxDecoration(
-                                  color: Colors.red,
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Center(
-                                  child: Container(
-                                    width: 56,
-                                    height: 56,
-                                    decoration: const BoxDecoration(
-                                      color: Colors.white,
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: Center(
-                                      child: Text(
-                                        "${_activeCamera?['speed_limit'] ?? '--'}",
-                                        style: const TextStyle(
-                                          color: Colors.black,
-                                          fontSize: 22,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
+                            const SizedBox(width: 18),
+
+                            Expanded(
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'SPEED CAMERA AHEAD',
+                                    style: TextStyle(
+                                      color: _warningTextColor()
+                                          .withValues(alpha: 0.75),
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 0.8,
                                     ),
                                   ),
-                                ),
+
+                                  const SizedBox(height: 8),
+
+                                  TweenAnimationBuilder<double>(
+                                    tween: Tween<double>(
+                                      begin: 0,
+                                      end: _displayedCameraDistanceMeters ?? 0,
+                                    ),
+                                    duration: const Duration(milliseconds: 350),
+                                    curve: Curves.easeOutCubic,
+                                    builder: (context, animatedDistance, child) {
+                                      return Text(
+                                        '${animatedDistance.toStringAsFixed(0)} m',
+                                        style: TextStyle(
+                                          color: _warningTextColor(),
+                                          fontSize: 40,
+                                          height: 1,
+                                          fontWeight: FontWeight.w900,
+                                        ),
+                                      );
+                                    },
+                                  ),
+
+                                  if ((_activeCamera?['street_name'] ?? '')
+                                      .toString()
+                                      .trim()
+                                      .isNotEmpty) ...[
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      _activeCamera!['street_name'].toString(),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        color: _warningTextColor()
+                                            .withValues(alpha: 0.7),
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ],
+                                ],
                               ),
                             ),
                           ],
@@ -840,7 +1015,6 @@ class _MapScreenState extends State<MapScreen>
                 ),
               ),
             
-
             Positioned(
               bottom: _currentPanelHeight > 0 
                   ? _currentPanelHeight + 15 
@@ -864,7 +1038,6 @@ class _MapScreenState extends State<MapScreen>
               ),
             ),
           
-
             if (_isLoading)
               Positioned.fill(
                 child: Container(
@@ -885,17 +1058,26 @@ class _MapScreenState extends State<MapScreen>
                 backgroundColor: _isCameraLocked ? Colors.blue : Colors.white,
                 foregroundColor: _isCameraLocked ? Colors.white : Colors.blue,
                 onPressed: () {
-                  if (mounted) {
-                    setState(() {
-                      _isCameraLocked = !_isCameraLocked; 
-                      if (_isCameraLocked && _currentLocation != null && _isMapReady) {
-                        _mapController!.animateCamera(
-                          mgl.CameraUpdate.newLatLng(
-                            mgl.LatLng(_currentLocation!.latitude, _currentLocation!.longitude),
+                  setState(() {
+                    _isCameraLocked = !_isCameraLocked;
+                  });
+
+                  if (_isCameraLocked) {
+                    if (_currentLocation != null &&
+                        _isMapReady &&
+                        _mapController != null) {
+                      _mapController!.animateCamera(
+                        mgl.CameraUpdate.newLatLng(
+                          mgl.LatLng(
+                            _currentLocation!.latitude,
+                            _currentLocation!.longitude,
                           ),
-                        );
-                      }
-                    });
+                        ),
+                      );
+                    }
+                  } else {
+                    _recenterDebounceTimer?.cancel();
+                    _recenterDebounceTimer = null;
                   }
                 },
                 child: Icon(_isCameraLocked ? Icons.gps_fixed : Icons.gps_not_fixed),
